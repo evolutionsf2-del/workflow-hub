@@ -1,4 +1,5 @@
 import os
+import gc
 import shutil
 import uuid
 from pathlib import Path
@@ -9,7 +10,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-from converters.pdf_converter import convert_pdf_to_docx
+from converters.pdf_converter import convert_pdf_to_docx, get_pdf_page_count, MAX_PAGES_LIMIT
 from converters.excel_converter import convert_excel_to_docx
 import openpyxl
 
@@ -31,12 +32,14 @@ TEMP_DIR.mkdir(exist_ok=True)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 def cleanup_file(path: Path):
-    """Safely removes a temporary file after response has been sent."""
+    """Safely removes a temporary file after response has been sent and frees memory."""
     try:
         if path.exists():
             path.unlink()
     except Exception as e:
         print(f"Failed to remove file {path}: {e}")
+    finally:
+        gc.collect()
 
 @app.get("/", response_class=HTMLResponse)
 async def serve_index():
@@ -49,10 +52,41 @@ async def serve_index():
 async def health_check():
     return {"status": "ok", "message": "Office Utility Hub is ready"}
 
+@app.post("/api/inspect/pdf-info")
+async def inspect_pdf_info(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
+    """Inspects PDF to return total page count and limits before conversion."""
+    filename_lower = file.filename.lower()
+    if not filename_lower.endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์ PDF (.pdf)")
+
+    file_id = str(uuid.uuid4())
+    input_path = TEMP_DIR / f"{file_id}_{file.filename}"
+
+    try:
+        with open(input_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        total_pages = get_pdf_page_count(str(input_path))
+        background_tasks.add_task(cleanup_file, input_path)
+        return {
+            "status": "success",
+            "filename": file.filename,
+            "total_pages": total_pages,
+            "max_allowed_pages": MAX_PAGES_LIMIT
+        }
+    except Exception as e:
+        cleanup_file(input_path)
+        raise HTTPException(status_code=400, detail=f"ไม่สามารถตรวจสอบข้อมูลไฟล์ PDF ได้: {str(e)}")
+
 @app.post("/api/convert/pdf-to-word")
 async def api_pdf_to_word(
     background_tasks: BackgroundTasks,
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    start_page: Optional[int] = Form(None),
+    end_page: Optional[int] = Form(None)
 ):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="กรุณาอัปโหลดไฟล์ที่มีนามสกุล .pdf เท่านั้น")
@@ -62,16 +96,28 @@ async def api_pdf_to_word(
     input_path = TEMP_DIR / input_filename
     
     base_name = os.path.splitext(file.filename)[0]
-    output_filename = f"{base_name}.docx"
-    output_path = TEMP_DIR / f"{file_id}_{output_filename}"
+    temp_output_filename = f"{file_id}_output.docx"
+    output_path = TEMP_DIR / temp_output_filename
 
     try:
         # Save uploaded file
         with open(input_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
 
-        # Convert
-        convert_pdf_to_docx(str(input_path), str(output_path))
+        # Convert with page limit & range check
+        _, actual_start, actual_end, total_pages = convert_pdf_to_docx(
+            pdf_path=str(input_path),
+            docx_path=str(output_path),
+            start_page=start_page,
+            end_page=end_page,
+            max_pages=MAX_PAGES_LIMIT
+        )
+
+        # Determine download filename
+        if actual_start == 1 and actual_end == total_pages:
+            download_filename = f"{base_name}.docx"
+        else:
+            download_filename = f"{base_name}_หน้า{actual_start}-{actual_end}.docx"
 
         # Schedule cleanup
         background_tasks.add_task(cleanup_file, input_path)
@@ -79,13 +125,21 @@ async def api_pdf_to_word(
 
         return FileResponse(
             path=output_path,
-            filename=output_filename,
+            filename=download_filename,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
+    except ValueError as ve:
+        cleanup_file(input_path)
+        if output_path.exists():
+            cleanup_file(output_path)
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         cleanup_file(input_path)
-        cleanup_file(output_path)
+        if output_path.exists():
+            cleanup_file(output_path)
         raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาดในการแปลงไฟล์: {str(e)}")
+    finally:
+        gc.collect()
 
 @app.post("/api/inspect/excel-sheets")
 async def inspect_excel_sheets(
@@ -152,6 +206,8 @@ async def api_excel_to_word(
         cleanup_file(input_path)
         cleanup_file(output_path)
         raise HTTPException(status_code=500, detail=f"เกิดข้อผิดพลาดในการแปลงไฟล์ Excel: {str(e)}")
+    finally:
+        gc.collect()
 
 if __name__ == "__main__":
     import uvicorn
