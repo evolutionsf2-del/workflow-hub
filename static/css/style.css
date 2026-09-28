@@ -1,0 +1,30 @@
+/* Custom styles for WorkFlow Hub */
+.dropzone.dragover {
+  border-color: #2563eb !important;
+  background-color: #eff6ff !important;
+  transform: scale(1.01);
+}
+
+.tab-btn {
+  user-select: none;
+}
+
+/* Smooth transitions */
+.transition-all {
+  transition-property: all;
+  transition-timing-function: cubic-bezier(0.4, 0, 0.2, 1);
+  transition-duration: 200ms;
+}
+
+/* Sheet badge selection */
+.sheet-badge {
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s ease-in-out;
+}
+
+.sheet-badge.selected {
+  background-color: #059669;
+  color: #ffffff;
+  border-color: #059669;
+}
